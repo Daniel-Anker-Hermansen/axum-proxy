@@ -1,0 +1,6 @@
+ip = "0.0.0.0"
+http_port = 1323
+https_port = 716
+ssl_cert = "/etc/letsencrypt/live/timelimits.danskspeedcubingforening.dk/cert.pem"
+ssl_key = "/etc/letsencrypt/live/timelimits.danskspeedcubingforening.dk/privkey.pem"
+proxy_path = "proxy"
