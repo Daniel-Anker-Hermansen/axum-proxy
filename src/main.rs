@@ -1,18 +1,76 @@
 use std::{net::IpAddr, sync::Arc};
 
-use axum::{Router, routing::any, extract::{Host, State}, response::Redirect};
+use axum::{Router, routing::any, extract::{Host, State, Path}, response::Redirect};
 use axum_server::tls_rustls::RustlsConfig;
-use http::{Request, Response, Version, Uri, uri::Scheme, StatusCode};
+use http::{Request, Response, Version, Uri, uri::Scheme, StatusCode, Method};
 use hyper::{Body, Client};
 use serde::Deserialize;
 
+async fn serve_folder(folder_path: &str, req: Request<Body>, prefix_len: Option<usize>) -> Response<Body> {
+    if req.method() != &Method::GET {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .expect("valid 404")
+    } 
+    else {
+        let parts = req.uri().clone().into_parts();
+        let prefix_len = prefix_len.unwrap_or(1);
+        // Unwrap is safe because it must have matched a prefix to get here.
+        let path = parts.path_and_query.as_ref().unwrap().as_str();
+        let new_path = &path[prefix_len..];
+        let file_path = format!("{folder_path}/{new_path}");
+        let file_path_index = if new_path.is_empty() {
+            format!("{folder_path}/index.html")
+        }
+        else {
+            format!("{folder_path}/{new_path}/index.html")
+        };
+        let mut contents = tokio::fs::read(&file_path).await;
+        contents = match contents {
+            Ok(v) => Ok(v),
+            Err(_) => tokio::fs::read(&file_path_index).await,
+        };
+        dbg!(&file_path);
+        let guess = mime_guess::from_path(&file_path).first();
+        dbg!(&guess);
+        let mime = guess.as_ref()
+            .map(|e| e.essence_str())
+            .unwrap_or(mime_guess::mime::TEXT.as_str());
+        dbg!(&mime);
+        if file_path.contains("..") {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .expect("valid 404");
+        }
+        match contents {
+            Ok(contents) => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", mime)
+                .body(Body::from(contents))
+                .expect("valid 200"),
+            Err(_) => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .expect("valid 404"),
+        }
+    }
+}
 
-async fn proxy(mut req: Request<Body>, port: u16) -> Response<Body> {
+async fn proxy(mut req: Request<Body>, port: u16, prefix_len: Option<usize>) -> Response<Body> {
     let val = format!("0.0.0.0:{port}");
     let mut parts = req.uri().clone().into_parts();
     // Unwrap is safe as it is correctly formatted per two lines above.
     parts.authority = Some(val.parse().unwrap());
     parts.scheme = Some(Scheme::HTTP);
+    if let Some(prefix_len) = prefix_len {
+        // Unwrap is safe because it must have matched a prefix to get here.
+        let path = parts.path_and_query.as_ref().unwrap().as_str();
+        let new_path = &path[prefix_len..];
+        parts.path_and_query = Some(new_path.parse().expect("This is a correct path"));
+    }
+    dbg!(parts.path_and_query.as_ref().map(|e| e.path()));
     // Unwrap is safe as we onlt changed athority and scheme both of which are valid.
     *req.uri_mut() = Uri::from_parts(parts).unwrap();
     *req.version_mut() = Version::HTTP_11;
@@ -24,10 +82,28 @@ async fn proxy(mut req: Request<Body>, port: u16) -> Response<Body> {
             .body(Body::empty()).unwrap())
 }
 
-async fn handler(Host(host): Host, State(redirect_rules): State<Arc<Vec<RedirectRule>>>, req: Request<Body>) -> Response<Body> {
+async fn handler(Host(host): Host, path: Option<Path<String>>, State(redirect_rules): State<Arc<Vec<RedirectRule>>>, req: Request<Body>) -> Response<Body> {
+    dbg!(&path);
     for rule in &*redirect_rules {
-        if host == rule.host_name {
-            return proxy(req, rule.port).await;
+        let rpath = rule.get_path();
+        let correct_path = match (&path, &rpath) {
+            (None, Some(_)) => false,
+            (Some(path), Some(rule_path)) => path.starts_with(rule_path),
+            _ => true,
+        };
+        // +1 because of slash being included in parts;
+        let prefix_len = rpath.as_ref().map(|path| path.len() + 1);
+        match rule {
+            RedirectRule::Proxy { host_name, port, .. } => {
+                if host == *host_name && correct_path {
+                    return proxy(req, *port, prefix_len).await;
+                }
+            },
+            RedirectRule::Folder { host_name, folder_path, .. } => {
+                if host == *host_name && correct_path {
+                    return serve_folder(folder_path, req, prefix_len).await;
+                } 
+            },
         }
     }
     Response::builder()
@@ -45,11 +121,29 @@ struct Config {
     ssl_key: String,
     proxy_path: Option<String>,
     wsgi_path: Option<String>,
+    static_path: Option<String>,
 }
 
-struct RedirectRule {
-    host_name: String,
-    port: u16
+enum RedirectRule {
+    Proxy {
+        host_name: String,
+        path: Option<String>,
+        port: u16,
+    },
+    Folder {
+        host_name: String,
+        folder_path: String,
+        path: Option<String>,
+    }
+}
+
+impl RedirectRule {
+    fn get_path(&self) -> &Option<String> {
+        match self {
+            RedirectRule::Proxy { path, .. } => path,
+            RedirectRule::Folder { path, .. } => path,
+        }
+    }
 }
 
 #[tokio::main]
@@ -76,6 +170,10 @@ async fn main() {
 
     if let Some(path) = config.wsgi_path {
         load_wsig_config(&path, &mut redirect_rules, 9300);
+    }
+    
+    if let Some(path) = config.static_path {
+        load_static_config(&path, &mut redirect_rules);
     }
 
     let app = Router::new()
@@ -121,6 +219,8 @@ async fn https_redirect(config: Config) {
 #[derive(Deserialize)]
 struct Proxy {
     cmd: Option<String>,
+    host: String,
+    path: Option<String>,
     port: u16,
 }
 
@@ -134,8 +234,7 @@ fn load_proxy_config(path: &str, redirect_rules: &mut Vec<RedirectRule>) {
             Ok(toml) => toml,
             Err(e) => panic!("Unable to parse proxy toml for file: {:?}. Error: {e}", file.path()),
         };
-        let host_name = file.path().iter().last().unwrap().to_str().unwrap().to_string();
-        redirect_rules.push(RedirectRule { host_name, port: toml.port });
+        redirect_rules.push(RedirectRule::Proxy { host_name: toml.host, port: toml.port, path: toml.path });
         if let Some(cmd) = toml.cmd {
             let mut iter = cmd.split_whitespace();
             let program = iter.next().expect("No program in prxoxy cmd");
@@ -149,6 +248,8 @@ fn load_proxy_config(path: &str, redirect_rules: &mut Vec<RedirectRule>) {
 
 #[derive(Deserialize)]
 struct Wsgi {
+    path: Option<String>,
+    host: String,
     file: String,
 }
 
@@ -161,8 +262,7 @@ fn load_wsig_config(path: &str, redirect_rules: &mut Vec<RedirectRule>, mut star
             Ok(toml) => toml,
             Err(e) => panic!("Unable to parse proxy toml for file: {:?}. Error: {e}", file.path()),
         };
-        let host_name = file.path().iter().last().unwrap().to_str().unwrap().to_string();
-        redirect_rules.push(RedirectRule { host_name, port: start_port });
+        redirect_rules.push(RedirectRule::Proxy { host_name: toml.host, port: start_port, path: toml.path });
         std::process::Command::new("uwsgi")
             .arg("--http")
             .arg(format!(":{start_port}"))
@@ -172,5 +272,24 @@ fn load_wsig_config(path: &str, redirect_rules: &mut Vec<RedirectRule>, mut star
             .expect("Uwsgi error, maybe invalid wsgi path");
         start_port += 1;
     }
+}
 
+#[derive(Deserialize)]
+struct Static {
+    path: Option<String>,
+    host: String,
+    file_path: String,
+}
+
+fn load_static_config(path: &str, redirect_rules: &mut Vec<RedirectRule>) {
+    let dir = std::fs::read_dir(path).expect("Unable to read proxy path");
+    for file in dir {
+        let file = file.expect("Unable to read file in proxy dir");
+        let content = std::fs::read_to_string(file.path()).expect("Unable to read file contents in proxy path");
+        let toml: Static = match toml::from_str(&content) {
+            Ok(toml) => toml,
+            Err(e) => panic!("Unable to parse proxy toml for file: {:?}. Error: {e}", file.path()),
+        };
+        redirect_rules.push(RedirectRule::Folder { host_name: toml.host, path: toml.path, folder_path: toml.file_path });
+    }
 }
