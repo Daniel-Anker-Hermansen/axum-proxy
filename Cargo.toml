@@ -11,6 +11,8 @@ axum-server = { version = "0.5.1", features = ["tls-rustls"] }
 http = "0.2.9"
 hyper = { version = "0.14.26", features = ["full"] }
 mime_guess = "2.0.4"
+rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.11.0"
 serde = { version = "1.0.163", features = ["derive"] }
 tokio = { version = "1.28.1", features = ["full"] }
 toml = "0.7.4"
