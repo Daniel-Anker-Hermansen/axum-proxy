@@ -2,12 +2,13 @@ use std::{net::IpAddr, sync::Arc};
 
 use axum::{
 	extract::{Host, Path, State},
+	handler::{Handler, HandlerWithoutStateExt},
 	response::Redirect,
 	routing::any,
 	Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use http::{uri::Scheme, Method, Request, Response, StatusCode, Uri, Version};
+use http::{uri::Scheme, HeaderValue, Method, Request, Response, StatusCode, Uri, Version};
 use hyper::{Body, Client};
 use rustls_pki_types::CertificateDer;
 use serde::Deserialize;
@@ -91,6 +92,20 @@ async fn proxy(mut req: Request<Body>, port: u16, prefix_len: Option<usize>) -> 
 }
 
 async fn handler(
+	host: Host,
+	path: Option<Path<String>>,
+	state: State<Arc<Vec<RedirectRule>>>,
+	req: Request<Body>,
+) -> Response<Body> {
+	let mut response = handler_inner(host, path, state, req).await;
+	response.headers_mut().insert(
+		"Strict-Transport-Security",
+		HeaderValue::from_static("max-age=31536000"),
+	);
+	response
+}
+
+async fn handler_inner(
 	Host(host): Host,
 	path: Option<Path<String>>,
 	State(redirect_rules): State<Arc<Vec<RedirectRule>>>,
@@ -194,10 +209,7 @@ async fn main() {
 		load_static_config(&path, &mut redirect_rules);
 	}
 
-	let app = Router::new()
-		.route("/", any(handler))
-		.route("/*path", any(handler))
-		.with_state(Arc::new(redirect_rules));
+	let app = handler.with_state(Arc::new(redirect_rules));
 
 	let cert = std::fs::read(&config.ssl_cert).expect("Certificate path is invalid");
 	let key = std::fs::read(&config.ssl_key).expect("Key path is invalid");
@@ -207,7 +219,6 @@ async fn main() {
 		.expect("Certificates are invalid");
 
 	let socket_addr = (config.ip, config.https_port);
-	let reload = reload_keys(tls_config.clone(), &config);
 	let server = async {
 		axum_server::bind_rustls(socket_addr.into(), tls_config)
 			.serve(app.into_make_service())
@@ -215,12 +226,17 @@ async fn main() {
 			.expect("HTTPS port is in use");
 	};
 
+	/*
+	let reload = reload_keys(tls_config.clone(), &config);
 	async {
 		tokio::join!(server, reload);
 	}
 	.await
+	*/
+	server.await
 }
 
+/*
 async fn reload_keys(tls_config: RustlsConfig, config: &Config) {
 	let (mut cert, mut key) = read_keys(&config).await;
 	loop {
@@ -238,13 +254,16 @@ async fn read_keys(config: &Config) -> (CertificateDer<'static>, rustls_pemfile:
 		if let (Ok(cert), Ok(key)) = (cert, key) {
 			let cert_opt = rustls_pemfile::read_one_from_slice(&cert).ok().flatten();
 			let key_opt = rustls_pemfile::read_one_from_slice(&key).ok().flatten();
-			if let (Some((rustls_pemfile::Item::X509Certificate(cert), _)), Some((key, _))) = (cert_opt, key_opt) {
+			if let (Some((rustls_pemfile::Item::X509Certificate(cert), _)), Some((key, _))) =
+				(cert_opt, key_opt)
+			{
 				return (cert, key);
 			}
 		}
 		tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 	}
 }
+*/
 
 async fn redirect(host: String, req: Request<Body>, http_port: u16, https_port: u16) -> Redirect {
 	let mut uri = req.uri().clone().into_parts();
@@ -262,23 +281,11 @@ async fn redirect(host: String, req: Request<Body>, http_port: u16, https_port: 
 }
 
 async fn https_redirect(config: Config) {
-	let app = Router::new()
-		.route(
-			"/",
-			any(move |Host(host): Host, req| {
-				redirect(host, req, config.http_port, config.https_port)
-			}),
-		)
-		.route(
-			"/*path",
-			any(move |Host(host): Host, req| {
-				redirect(host, req, config.http_port, config.https_port)
-			}),
-		);
-
+	let handler =
+		move |Host(host): Host, req| redirect(host, req, config.http_port, config.https_port);
 	let socket_addr = (config.ip, config.http_port);
 	axum_server::bind(socket_addr.into())
-		.serve(app.into_make_service())
+		.serve(handler.into_make_service())
 		.await
 		.expect("HTTP port is in use");
 }
