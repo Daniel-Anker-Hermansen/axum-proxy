@@ -1,16 +1,20 @@
-use std::{net::IpAddr, sync::Arc};
+use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
 
+use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use axum::{
-	extract::{Host, Path, State},
+	body::Body,
+	extract::{Path, State},
 	response::Redirect,
 	routing::any,
 	Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use http::{uri::Scheme, Method, Request, Response, StatusCode, Uri, Version};
-use hyper::{Body, Client};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use rustls::crypto::ring;
 use rustls_pki_types::CertificateDer;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
 async fn serve_folder(
 	folder_path: &str,
@@ -20,6 +24,7 @@ async fn serve_folder(
 	if req.method() != &Method::GET {
 		Response::builder()
 			.status(StatusCode::NOT_FOUND)
+			.header("content-type", "text/plain")
 			.body(Body::empty())
 			.expect("valid 404")
 	} else {
@@ -80,22 +85,40 @@ async fn proxy(mut req: Request<Body>, port: u16, prefix_len: Option<usize>) -> 
 	// Unwrap is safe as we onlt changed athority and scheme both of which are valid.
 	*req.uri_mut() = Uri::from_parts(parts).unwrap();
 	*req.version_mut() = Version::HTTP_11;
-	let client = Client::default();
-	client.request(req).await.unwrap_or(
-		Response::builder()
-			.status(StatusCode::INTERNAL_SERVER_ERROR)
-			// This unwrap should be safe as it is a valid response
-			.body(Body::empty())
-			.unwrap(),
-	)
+	let client = Client::builder(TokioExecutor::new()).build_http();
+	client
+		.request(req)
+		.await
+		.map(|res| res.map(|body| Body::new(body)))
+		.unwrap_or(
+			Response::builder()
+				.status(StatusCode::INTERNAL_SERVER_ERROR)
+				// This unwrap should be safe as it is a valid response
+				.body(Body::empty())
+				.unwrap(),
+		)
 }
 
 async fn handler(
-	Host(host): Host,
+	uri: Uri,
 	path: Option<Path<String>>,
 	State(redirect_rules): State<Arc<Vec<RedirectRule>>>,
 	req: Request<Body>,
 ) -> Response<Body> {
+	if let Some(path) = &path {
+		dbg!(&path);
+		if path.starts_with(".well-known/acme-challenge/") {
+			let token = &path[".well-known/acme-challenge/".len()..];
+			dbg!("Is this?");
+			let data = get_acme(token).await;
+			if let Some(file) = data {
+				return Response::builder()
+					.status(StatusCode::OK)
+					.body(Body::from(file))
+					.unwrap();
+			}
+		}
+	}
 	for rule in &*redirect_rules {
 		let rpath = rule.get_path();
 		let correct_path = match (&path, &rpath) {
@@ -109,7 +132,7 @@ async fn handler(
 			RedirectRule::Proxy {
 				host_name, port, ..
 			} => {
-				if host == *host_name && correct_path {
+				if uri.host() == Some(host_name) && correct_path {
 					return proxy(req, *port, prefix_len).await;
 				}
 			}
@@ -118,7 +141,7 @@ async fn handler(
 				folder_path,
 				..
 			} => {
-				if host == *host_name && correct_path {
+				if uri.host() == Some(host_name) && correct_path {
 					return serve_folder(folder_path, req, prefix_len).await;
 				}
 			}
@@ -166,6 +189,8 @@ impl RedirectRule {
 
 #[tokio::main]
 async fn main() {
+	ring::default_provider().install_default().unwrap();
+
 	let mut args = std::env::args();
 	let config: Config = match args.nth(1) {
 		Some(config) => match std::fs::read_to_string(&config) {
@@ -187,7 +212,7 @@ async fn main() {
 	}
 
 	if let Some(path) = &config.wsgi_path {
-		load_wsig_config(&path, &mut redirect_rules, 9300);
+		load_wsgi_config(&path, &mut redirect_rules, 9300);
 	}
 
 	if let Some(path) = &config.static_path {
@@ -195,8 +220,19 @@ async fn main() {
 	}
 
 	let app = Router::new()
+		.route(
+			"/.well-known/acme-challenge/{token}",
+			any(async |Path(token): Path<String>| {
+				dbg!("https");
+				dbg!(&token);
+				match get_acme(&token).await {
+					Some(file) => file,
+					None => "".to_string(),
+				}
+			}),
+		)
 		.route("/", any(handler))
-		.route("/*path", any(handler))
+		.route("/{*path}", any(handler))
 		.with_state(Arc::new(redirect_rules));
 
 	let cert = std::fs::read(&config.ssl_cert).expect("Certificate path is invalid");
@@ -207,7 +243,6 @@ async fn main() {
 		.expect("Certificates are invalid");
 
 	let socket_addr = (config.ip, config.https_port);
-	let reload = reload_keys(tls_config.clone(), &config);
 	let server = async {
 		axum_server::bind_rustls(socket_addr.into(), tls_config)
 			.serve(app.into_make_service())
@@ -215,10 +250,15 @@ async fn main() {
 			.expect("HTTPS port is in use");
 	};
 
+	server.await;
+	/*
+
+	let reload = reload_keys(tls_config.clone(), &config);
 	async {
 		tokio::join!(server, reload);
 	}
 	.await
+	*/
 }
 
 async fn reload_keys(tls_config: RustlsConfig, config: &Config) {
@@ -238,7 +278,9 @@ async fn read_keys(config: &Config) -> (CertificateDer<'static>, rustls_pemfile:
 		if let (Ok(cert), Ok(key)) = (cert, key) {
 			let cert_opt = rustls_pemfile::read_one_from_slice(&cert).ok().flatten();
 			let key_opt = rustls_pemfile::read_one_from_slice(&key).ok().flatten();
-			if let (Some((rustls_pemfile::Item::X509Certificate(cert), _)), Some((key, _))) = (cert_opt, key_opt) {
+			if let (Some((rustls_pemfile::Item::X509Certificate(cert), _)), Some((key, _))) =
+				(cert_opt, key_opt)
+			{
 				return (cert, key);
 			}
 		}
@@ -246,13 +288,17 @@ async fn read_keys(config: &Config) -> (CertificateDer<'static>, rustls_pemfile:
 	}
 }
 
-async fn redirect(host: String, req: Request<Body>, http_port: u16, https_port: u16) -> Redirect {
+async fn redirect(req: Request<Body>, http_port: u16, https_port: u16) -> Redirect {
 	let mut uri = req.uri().clone().into_parts();
+	dbg!(&uri.path_and_query);
 	// As long as we do not have numbers in our hostnames this should correctly change the port and
 	// thus the new uri is valid. Although it is suspisous that host includes port for HTTP but not
 	// for HTTPS.
 	uri.authority = Some(
-		host.replace(&http_port.to_string(), &https_port.to_string())
+		uri.authority
+			.expect("there is an authority")
+			.to_string()
+			.replace(&http_port.to_string(), &https_port.to_string())
 			.parse()
 			.unwrap(),
 	);
@@ -261,19 +307,97 @@ async fn redirect(host: String, req: Request<Body>, http_port: u16, https_port: 
 	Redirect::permanent(&Uri::from_parts(uri).unwrap().to_string())
 }
 
+static ACME_FILES: Mutex<BTreeMap<String, String>> = Mutex::const_new(BTreeMap::new());
+
+async fn insert_acme(token: String, proof: String) {
+	ACME_FILES.lock().await.insert(token, proof);
+}
+
+async fn remove_acme(token: &str) {
+	ACME_FILES.lock().await.remove(token);
+}
+
+async fn get_acme(token: &str) -> Option<String> {
+	ACME_FILES.lock().await.get(token).cloned()
+}
+
+async fn acme() -> acme_lib::Result<()> {
+	let url = DirectoryUrl::LetsEncryptStaging;
+	let persistent = FilePersist::new(".");
+	let dir = Directory::from_url(persistent, url)?;
+	let acc = dir.account("daniel201001@gmail.com")?;
+	let mut ord_new = acc.new_order(
+		"fm.danskspeedcubingforening.dk",
+		&["tools.danskspeedcubingforening.dk"],
+	)?;
+	let ord_csr = loop {
+		if let Some(ord_csr) = ord_new.confirm_validations() {
+			eprintln!("Did we break?");
+			break ord_csr;
+		}
+		let auths = ord_new.authorizations()?;
+		let chall = auths
+			.iter()
+			.find(|auth| auth.need_challenge())
+			.expect("at least one needs challenge")
+			.http_challenge();
+		let token = chall.http_token().to_string();
+		dbg!(&token);
+		let proof = chall.http_proof();
+		dbg!(&proof);
+		dbg!(&ord_new.api_order());
+		insert_acme(token.clone(), proof).await;
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		let handle = std::thread::spawn(|| {
+			tx.send(chall.validate(1000)).unwrap();
+		});
+		rx.await.unwrap()?;
+		handle.join().unwrap();
+		dbg!("validated");
+		ord_new.refresh()?;
+		remove_acme(&token).await;
+	};
+	let pkey_pri = create_p384_key();
+	dbg!("key");
+	let (tx, rx) = tokio::sync::oneshot::channel();
+	let handle = std::thread::spawn(|| {
+		assert!(tx.send(ord_csr.finalize_pkey(pkey_pri, 1000)).is_ok());
+	});
+	let ord_cert = rx.await.unwrap()?;
+	handle.join().unwrap();
+	dbg!("finalize");
+	let cert = ord_cert.download_and_save_cert()?;
+	dbg!(&cert);
+	Ok(())
+}
+
 async fn https_redirect(config: Config) {
 	let app = Router::new()
 		.route(
-			"/",
-			any(move |Host(host): Host, req| {
-				redirect(host, req, config.http_port, config.https_port)
+			"/.renew-certificate",
+			any(async || match acme().await {
+				Ok(_) => "Success".to_string(),
+				Err(e) => e.to_string(),
 			}),
 		)
 		.route(
-			"/*path",
-			any(move |Host(host): Host, req| {
-				redirect(host, req, config.http_port, config.https_port)
+			"/.well-known/acme-challenge/{token}",
+			any(async |Path(token): Path<String>| {
+				dbg!("http");
+				dbg!(&token);
+				match get_acme(&token).await {
+					Some(file) => file,
+					None => "".to_string(),
+				}
 			}),
+		)
+		.route(
+			"/",
+			any(move |req| redirect(req, config.http_port, config.https_port)),
+		)
+		.route(
+			"/{*path}",
+			any(move |req| redirect(req, config.http_port, config.https_port)),
 		);
 
 	let socket_addr = (config.ip, config.http_port);
@@ -327,7 +451,7 @@ struct Wsgi {
 	file: String,
 }
 
-fn load_wsig_config(path: &str, redirect_rules: &mut Vec<RedirectRule>, mut start_port: u16) {
+fn load_wsgi_config(path: &str, redirect_rules: &mut Vec<RedirectRule>, mut start_port: u16) {
 	let dir = std::fs::read_dir(path).expect("Unable to read proxy path");
 	for file in dir {
 		let file = file.expect("Unable to read file in proxy dir");
