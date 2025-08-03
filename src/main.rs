@@ -1,20 +1,16 @@
-use std::{collections::BTreeMap, net::IpAddr, sync::Arc};
+use std::{net::IpAddr, sync::Arc};
 
-use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
-use axum::{
-	body::Body,
-	extract::{Path, State},
-	response::Redirect,
-	routing::any,
-	Router,
-};
+use ::http::{Method, Request, Response, StatusCode, Uri, Version, uri::Scheme};
+use acme_lib::{Account, persist::FilePersist};
+use axum::{body::Body, extract::State, routing::any};
+use axum_extra::extract::Host;
 use axum_server::tls_rustls::RustlsConfig;
-use http::{uri::Scheme, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use rustls::crypto::ring;
-use rustls_pki_types::CertificateDer;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+
+mod acme;
+mod http;
 
 async fn serve_folder(
 	folder_path: &str,
@@ -100,30 +96,16 @@ async fn proxy(mut req: Request<Body>, port: u16, prefix_len: Option<usize>) -> 
 }
 
 async fn handler(
-	uri: Uri,
-	path: Option<Path<String>>,
+	Host(host): Host,
 	State(redirect_rules): State<Arc<Vec<RedirectRule>>>,
 	req: Request<Body>,
 ) -> Response<Body> {
-	if let Some(path) = &path {
-		dbg!(&path);
-		if path.starts_with(".well-known/acme-challenge/") {
-			let token = &path[".well-known/acme-challenge/".len()..];
-			dbg!("Is this?");
-			let data = get_acme(token).await;
-			if let Some(file) = data {
-				return Response::builder()
-					.status(StatusCode::OK)
-					.body(Body::from(file))
-					.unwrap();
-			}
-		}
-	}
 	for rule in &*redirect_rules {
+		let path = req.uri().path();
 		let rpath = rule.get_path();
-		let correct_path = match (&path, &rpath) {
-			(None, Some(_)) => false,
-			(Some(path), Some(rule_path)) => path.starts_with(rule_path),
+		let correct_path = match (path, &rpath) {
+			("", Some(_)) => false,
+			(path, Some(rule_path)) => path.starts_with(rule_path),
 			_ => true,
 		};
 		// +1 because of slash being included in parts;
@@ -132,7 +114,7 @@ async fn handler(
 			RedirectRule::Proxy {
 				host_name, port, ..
 			} => {
-				if uri.host() == Some(host_name) && correct_path {
+				if host == *host_name && correct_path {
 					return proxy(req, *port, prefix_len).await;
 				}
 			}
@@ -141,7 +123,7 @@ async fn handler(
 				folder_path,
 				..
 			} => {
-				if uri.host() == Some(host_name) && correct_path {
+				if host == *host_name && correct_path {
 					return serve_folder(folder_path, req, prefix_len).await;
 				}
 			}
@@ -158,8 +140,8 @@ struct Config {
 	ip: IpAddr,
 	http_port: u16,
 	https_port: u16,
-	ssl_cert: String,
-	ssl_key: String,
+	email: String,
+	domains: Vec<String>,
 	proxy_path: Option<String>,
 	wsgi_path: Option<String>,
 	static_path: Option<String>,
@@ -203,7 +185,15 @@ async fn main() {
 		None => panic!("No config supplied"),
 	};
 
-	tokio::spawn(https_redirect(config.clone()));
+	// We need to spawn the http server before requesting certificates as the challenge needs
+	// it to be running
+	tokio::spawn(http::http_server(config.clone()));
+
+	let mut account = acme::account(&config.email).unwrap();
+	let domains: Vec<&str> = config.domains.iter().map(String::as_str).collect();
+	let certificate = acme::get_certificate(&mut account, &domains)
+		.await
+		.unwrap();
 
 	let mut redirect_rules = Vec::new();
 
@@ -219,30 +209,16 @@ async fn main() {
 		load_static_config(&path, &mut redirect_rules);
 	}
 
-	let app = Router::new()
-		.route(
-			"/.well-known/acme-challenge/{token}",
-			any(async |Path(token): Path<String>| {
-				dbg!("https");
-				dbg!(&token);
-				match get_acme(&token).await {
-					Some(file) => file,
-					None => "".to_string(),
-				}
-			}),
-		)
-		.route("/", any(handler))
-		.route("/{*path}", any(handler))
-		.with_state(Arc::new(redirect_rules));
+	let app = any(handler).with_state(Arc::new(redirect_rules));
 
-	let cert = std::fs::read(&config.ssl_cert).expect("Certificate path is invalid");
-	let key = std::fs::read(&config.ssl_key).expect("Key path is invalid");
-
+	let cert = certificate.certificate().as_bytes().to_vec();
+	let key = certificate.private_key().as_bytes().to_vec();
 	let tls_config = RustlsConfig::from_pem(cert, key)
 		.await
 		.expect("Certificates are invalid");
 
 	let socket_addr = (config.ip, config.https_port);
+	let reload = reload_keys(tls_config.clone(), &config, &mut account);
 	let server = async {
 		axum_server::bind_rustls(socket_addr.into(), tls_config)
 			.serve(app.into_make_service())
@@ -250,161 +226,31 @@ async fn main() {
 			.expect("HTTPS port is in use");
 	};
 
-	server.await;
-	/*
-
-	let reload = reload_keys(tls_config.clone(), &config);
 	async {
 		tokio::join!(server, reload);
 	}
 	.await
-	*/
 }
 
-async fn reload_keys(tls_config: RustlsConfig, config: &Config) {
-	let (mut cert, mut key) = read_keys(&config).await;
+async fn reload_keys(
+	tls_config: RustlsConfig,
+	config: &Config,
+	account: &mut Account<FilePersist>,
+) {
+	let domains: Vec<&str> = config.domains.iter().map(String::as_str).collect();
 	loop {
-		dbg!(&cert, &key);
-		println!("Reload loaded?");
-		tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-		(cert, key) = read_keys(&config).await;
+		let certificate = acme::get_certificate(account, &domains)
+			.await
+			.unwrap();
+		let cert = certificate.certificate().as_bytes().to_vec();
+		let key = certificate.private_key().as_bytes().to_vec();
+		tls_config.reload_from_pem(cert, key).await.unwrap();
+		tokio::time::sleep(
+			std::time::Duration::from_secs((certificate.valid_days_left() - 30) as u64)
+				* 24 * 60 * 60,
+		)
+		.await;
 	}
-}
-
-async fn read_keys(config: &Config) -> (CertificateDer<'static>, rustls_pemfile::Item) {
-	loop {
-		let cert = tokio::fs::read(&config.ssl_cert).await;
-		let key = tokio::fs::read(&config.ssl_key).await;
-		if let (Ok(cert), Ok(key)) = (cert, key) {
-			let cert_opt = rustls_pemfile::read_one_from_slice(&cert).ok().flatten();
-			let key_opt = rustls_pemfile::read_one_from_slice(&key).ok().flatten();
-			if let (Some((rustls_pemfile::Item::X509Certificate(cert), _)), Some((key, _))) =
-				(cert_opt, key_opt)
-			{
-				return (cert, key);
-			}
-		}
-		tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-	}
-}
-
-async fn redirect(req: Request<Body>, http_port: u16, https_port: u16) -> Redirect {
-	let mut uri = req.uri().clone().into_parts();
-	dbg!(&uri.path_and_query);
-	// As long as we do not have numbers in our hostnames this should correctly change the port and
-	// thus the new uri is valid. Although it is suspisous that host includes port for HTTP but not
-	// for HTTPS.
-	uri.authority = Some(
-		uri.authority
-			.expect("there is an authority")
-			.to_string()
-			.replace(&http_port.to_string(), &https_port.to_string())
-			.parse()
-			.unwrap(),
-	);
-	uri.scheme = Some(Scheme::HTTPS);
-	// Unwrap is safe as the new scheme and authority are valid.
-	Redirect::permanent(&Uri::from_parts(uri).unwrap().to_string())
-}
-
-static ACME_FILES: Mutex<BTreeMap<String, String>> = Mutex::const_new(BTreeMap::new());
-
-async fn insert_acme(token: String, proof: String) {
-	ACME_FILES.lock().await.insert(token, proof);
-}
-
-async fn remove_acme(token: &str) {
-	ACME_FILES.lock().await.remove(token);
-}
-
-async fn get_acme(token: &str) -> Option<String> {
-	ACME_FILES.lock().await.get(token).cloned()
-}
-
-async fn acme() -> acme_lib::Result<()> {
-	let url = DirectoryUrl::LetsEncryptStaging;
-	let persistent = FilePersist::new(".");
-	let dir = Directory::from_url(persistent, url)?;
-	let acc = dir.account("daniel201001@gmail.com")?;
-	let mut ord_new = acc.new_order(
-		"fm.danskspeedcubingforening.dk",
-		&["tools.danskspeedcubingforening.dk"],
-	)?;
-	let ord_csr = loop {
-		if let Some(ord_csr) = ord_new.confirm_validations() {
-			eprintln!("Did we break?");
-			break ord_csr;
-		}
-		let auths = ord_new.authorizations()?;
-		let chall = auths
-			.iter()
-			.find(|auth| auth.need_challenge())
-			.expect("at least one needs challenge")
-			.http_challenge();
-		let token = chall.http_token().to_string();
-		dbg!(&token);
-		let proof = chall.http_proof();
-		dbg!(&proof);
-		dbg!(&ord_new.api_order());
-		insert_acme(token.clone(), proof).await;
-		let (tx, rx) = tokio::sync::oneshot::channel();
-		let handle = std::thread::spawn(|| {
-			tx.send(chall.validate(1000)).unwrap();
-		});
-		rx.await.unwrap()?;
-		handle.join().unwrap();
-		dbg!("validated");
-		ord_new.refresh()?;
-		remove_acme(&token).await;
-	};
-	let pkey_pri = create_p384_key();
-	dbg!("key");
-	let (tx, rx) = tokio::sync::oneshot::channel();
-	let handle = std::thread::spawn(|| {
-		assert!(tx.send(ord_csr.finalize_pkey(pkey_pri, 1000)).is_ok());
-	});
-	let ord_cert = rx.await.unwrap()?;
-	handle.join().unwrap();
-	dbg!("finalize");
-	let cert = ord_cert.download_and_save_cert()?;
-	dbg!(&cert);
-	Ok(())
-}
-
-async fn https_redirect(config: Config) {
-	let app = Router::new()
-		.route(
-			"/.renew-certificate",
-			any(async || match acme().await {
-				Ok(_) => "Success".to_string(),
-				Err(e) => e.to_string(),
-			}),
-		)
-		.route(
-			"/.well-known/acme-challenge/{token}",
-			any(async |Path(token): Path<String>| {
-				dbg!("http");
-				dbg!(&token);
-				match get_acme(&token).await {
-					Some(file) => file,
-					None => "".to_string(),
-				}
-			}),
-		)
-		.route(
-			"/",
-			any(move |req| redirect(req, config.http_port, config.https_port)),
-		)
-		.route(
-			"/{*path}",
-			any(move |req| redirect(req, config.http_port, config.https_port)),
-		);
-
-	let socket_addr = (config.ip, config.http_port);
-	axum_server::bind(socket_addr.into())
-		.serve(app.into_make_service())
-		.await
-		.expect("HTTP port is in use");
 }
 
 #[derive(Deserialize)]
