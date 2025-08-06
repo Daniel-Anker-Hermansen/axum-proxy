@@ -1,4 +1,4 @@
-use std::{net::IpAddr, sync::Arc};
+use std::{io::Write as _, net::IpAddr, sync::Arc};
 
 use ::http::{Method, Request, Response, StatusCode, Uri, Version, uri::Scheme};
 use acme_lib::{Account, persist::FilePersist};
@@ -191,22 +191,20 @@ async fn main() {
 
 	let mut account = acme::account(&config.email).unwrap();
 	let domains: Vec<&str> = config.domains.iter().map(String::as_str).collect();
-	let certificate = acme::get_certificate(&mut account, &domains)
-		.await
-		.unwrap();
+	let certificate = acme::get_certificate(&mut account, &domains).await.unwrap();
 
 	let mut redirect_rules = Vec::new();
 
 	if let Some(path) = &config.proxy_path {
-		load_proxy_config(&path, &mut redirect_rules);
+		load_proxy_config(path, &mut redirect_rules);
 	}
 
 	if let Some(path) = &config.wsgi_path {
-		load_wsgi_config(&path, &mut redirect_rules, 9300);
+		load_wsgi_config(path, &mut redirect_rules, 9300);
 	}
 
 	if let Some(path) = &config.static_path {
-		load_static_config(&path, &mut redirect_rules);
+		load_static_config(path, &mut redirect_rules);
 	}
 
 	let app = any(handler).with_state(Arc::new(redirect_rules));
@@ -239,16 +237,29 @@ async fn reload_keys(
 ) {
 	let domains: Vec<&str> = config.domains.iter().map(String::as_str).collect();
 	loop {
-		let certificate = acme::get_certificate(account, &domains)
-			.await
-			.unwrap();
+		let certificate = match acme::get_certificate(account, &domains).await {
+			Ok(certificates) => certificates,
+			Err(err) => {
+				if let Ok(mut file) = std::fs::OpenOptions::new()
+					.write(true)
+					.create(true)
+					.truncate(true)
+					.open("/axum-certificate-log")
+				{
+					// Write the error
+					let _ = writeln!(&mut file, "{err}");
+				}
+				// Retry in 12 hours.
+				tokio::time::sleep(std::time::Duration::from_secs(12 * 60 * 60)).await;
+				continue;
+			}
+		};
 		let cert = certificate.certificate().as_bytes().to_vec();
 		let key = certificate.private_key().as_bytes().to_vec();
 		tls_config.reload_from_pem(cert, key).await.unwrap();
-		tokio::time::sleep(
-			std::time::Duration::from_secs((certificate.valid_days_left() - 30) as u64)
-				* 24 * 60 * 60,
-		)
+		tokio::time::sleep(std::time::Duration::from_secs(
+			(certificate.valid_days_left() - 30) as u64 * 24 * 60 * 60,
+		))
 		.await;
 	}
 }

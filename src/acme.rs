@@ -30,6 +30,10 @@ pub async fn get_certificate(
 	account: &mut Account<FilePersist>,
 	domains: &[&str],
 ) -> acme_lib::Result<Certificate> {
+	// Unwraps only happen in relation to threading due to blocking api instead of an async
+	// api.
+
+
 	let name = domains[0];
 	let alt_names = &domains[1..];
 	// Try to find a certificate with good remaining validity
