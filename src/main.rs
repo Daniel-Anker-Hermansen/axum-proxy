@@ -17,7 +17,7 @@ async fn serve_folder(
 	req: Request<Body>,
 	prefix_len: Option<usize>,
 ) -> Response<Body> {
-	if req.method() != &Method::GET {
+	if req.method() != Method::GET {
 		Response::builder()
 			.status(StatusCode::NOT_FOUND)
 			.header("content-type", "text/plain")
@@ -85,7 +85,7 @@ async fn proxy(mut req: Request<Body>, port: u16, prefix_len: Option<usize>) -> 
 	client
 		.request(req)
 		.await
-		.map(|res| res.map(|body| Body::new(body)))
+		.map(|res| res.map(Body::new))
 		.unwrap_or(
 			Response::builder()
 				.status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -108,8 +108,7 @@ async fn handler(
 			(path, Some(rule_path)) => path.starts_with(rule_path),
 			_ => true,
 		};
-		// +1 because of slash being included in parts;
-		let prefix_len = rpath.as_ref().map(|path| path.len() + 1);
+		let prefix_len = rpath.as_ref().map(|path| path.len());
 		match rule {
 			RedirectRule::Proxy {
 				host_name, port, ..
@@ -147,6 +146,7 @@ struct Config {
 	static_path: Option<String>,
 }
 
+#[derive(Debug)]
 enum RedirectRule {
 	Proxy {
 		host_name: String,
@@ -199,6 +199,7 @@ async fn main() {
 		load_proxy_config(path, &mut redirect_rules);
 	}
 
+	// We need a better system to handle prescedence
 	if let Some(path) = &config.wsgi_path {
 		load_wsgi_config(path, &mut redirect_rules, 9300);
 	}
